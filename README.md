@@ -28,6 +28,63 @@ speaks the reply back — while logging LLMOps metrics for every API call.
 All calls ──▶ metrics_log.csv ──▶ 📊 LLMOps Dashboard tab
 ```
 
+## Sub-tasks implemented (7)
+
+| # | Sub-task | Category | Model / API | API method |
+|---|---|---|---|---|
+| 1 | Speech-to-Text | Speech Recognition | `openai/whisper-large-v3` (HF Inference API) | `automatic_speech_recognition` |
+| 2 | Text-to-Speech | Speech Recognition | gTTS (Google Text-to-Speech API) | `gTTS().save()` |
+| 3 | Sentiment Analysis | NLP | `distilbert/distilbert-base-uncased-finetuned-sst-2-english` (HF) | `text_classification` |
+| 4 | Intent Classification | NLP | `facebook/bart-large-mnli` (zero-shot, HF) **+** our fine-tuned DistilBERT | `zero_shot_classification` + local pipeline |
+| 5 | Named Entity Recognition | NLP | `dslim/bert-base-NER` (HF) | `token_classification` |
+| 6 | Summarization | NLP | `facebook/bart-large-cnn` (HF) | `summarization` |
+| 7 | Response Generation | NLP | `Qwen/Qwen2.5-7B-Instruct` (HF router, OpenAI-style chat) | `chat_completion` |
+
+### 1. Speech-to-Text (`speech_to_text`)
+Converts the customer's recorded/uploaded voice complaint into text using Whisper-large-v3
+over the Hugging Face Inference API. **Input:** audio file (microphone or upload) →
+**Output:** transcript string that feeds every downstream NLP sub-task.
+**Metrics logged:** latency, word count, character count.
+
+### 2. Text-to-Speech (`text_to_speech`)
+Speaks the AI-generated reply back to the customer using the gTTS API (first 500 chars),
+saving an MP3 that plays in the browser. **Input:** reply text → **Output:** MP3 audio.
+**Metrics logged:** latency, word count.
+
+### 3. Sentiment Analysis (`analyze_sentiment`)
+Classifies the complaint as POSITIVE/NEGATIVE with a confidence score using DistilBERT
+fine-tuned on SST-2. The detected sentiment is also injected into the reply-generation
+prompt so the LLM can match its tone to the customer's mood.
+**Metrics logged:** latency, confidence.
+
+### 4. Intent Classification (`classify_intent_zeroshot` + `classify_intent_finetuned`)
+Two models run side by side on every complaint — a strong comparison point:
+- **Zero-shot baseline:** BART-large-MNLI scores the complaint against 7 candidate intents
+  (refund request, cancel order, delivery problem, payment issue, product complaint,
+  account help, general enquiry) with no training.
+- **Our fine-tuned model (requirement #8):** DistilBERT fine-tuned on the Bitext Customer
+  Support dataset (~27k utterances, 27 intents), loaded from `./intent-model`.
+
+The UI shows both predictions with confidences so zero-shot vs fine-tuned quality is
+directly visible. **Metrics logged:** latency and confidence for each model separately.
+
+### 5. Named Entity Recognition (`extract_entities`)
+Extracts people, organisations, and locations (e.g. *Priya=PER, Chennai=LOC*) from the
+complaint using BERT-base-NER, giving the human agent structured ticket fields.
+**Metrics logged:** latency, average entity confidence, entity count.
+
+### 6. Summarization (`summarize`)
+Condenses long complaints into a short ticket summary for the human agent using
+BART-large-CNN (complaints under 15 words are passed through unchanged). Summary quality
+is scored automatically with **ROUGE-1 F1** against the original complaint.
+**Metrics logged:** latency, ROUGE-1 F1, summary token count.
+
+### 7. Response Generation (`generate_response`)
+Drafts a short, empathetic, professional reply (≤120 words) with a concrete next step
+using Qwen2.5-7B-Instruct via the HF router's OpenAI-compatible chat API. The prompt is
+grounded with the outputs of sub-tasks 3 and 4 (sentiment + detected intent).
+**Metrics logged:** latency, total tokens, estimated cost (USD).
+
 ## Setup (5 minutes)
 
 1. Get a free Hugging Face token: https://huggingface.co/settings/tokens (Read access).
