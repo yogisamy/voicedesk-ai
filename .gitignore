@@ -8,8 +8,8 @@ __pycache__/
 *.pyc
 
 # Runtime-generated metrics (recreated on each run)
-metrics_log.csv
-finetune_run.log
+# metrics_log.csv
+# finetune_run.log
 
 # MLflow local tracking store
 mlruns/
