@@ -38,7 +38,8 @@ flowchart TB
 
     GTTS["☁️ [2] gTTS API<br/>Text-to-Speech"]
     CSV[("metrics_log.csv")]
-    MLF[("MLflow tracking store<br/>(mlflow ui)")]
+    MLF[("MLflow tracking store<br/>sqlite:///mlflow.db — view with mlflow ui")]
+    FTS["🛠️ finetune_intent.py<br/>DistilBERT training job<br/>(Colab T4 or local Apple-GPU)"]
 
     MIC --> UI
     TXT --> UI
@@ -47,7 +48,9 @@ flowchart TB
     ORCH --> FT
     ORCH --> GTTS
     ORCH --> LOGGER --> CSV --> DASH
-    LOGGER --> MLF
+    LOGGER -- "one MLflow run per pipeline<br/>+ per feedback event" --> MLF
+    FTS -- "saves model" --> FT
+    FTS -- "hyperparams + accuracy/F1" --> MLF
     ORCH --> SPK
 ```
 
@@ -63,9 +66,12 @@ sequenceDiagram
     participant FT as Local fine-tuned<br/>DistilBERT
     participant G as gTTS API
     participant CSV as metrics_log.csv
+    participant ML as MLflow<br/>(mlflow.db)
 
     User->>UI: record / type complaint, click ▶ Run
     UI->>P: (audio, typed_text)
+    P->>ML: start_run("pipeline-<timestamp>") + input params
+    Note over P,ML: every metric row written to the CSV below is<br/>also mirrored to the active MLflow run by log_metric()
 
     P->>HF: speech_to_text() — whisper-large-v3
     HF-->>P: transcript
@@ -97,10 +103,11 @@ sequenceDiagram
     P->>G: text_to_speech(reply)
     G-->>P: MP3 audio
     P->>CSV: latency
+    P->>ML: end_run()
 
-    P-->>UI: transcript, sentiment, intents, entities, summary, reply, audio
+    P-->>UI: streams each result live as its step completes<br/>(generator: transcript → … → reply → audio)
     UI-->>User: display results + play spoken reply
-    User->>UI: 👍 / 👎 feedback → logged to CSV
+    User->>UI: 👍 / 👎 feedback → logged to CSV + MLflow run
 ```
 
 ## Sub-tasks implemented (7)
@@ -169,6 +176,11 @@ grounded with the outputs of sub-tasks 3 and 4 (sentiment + detected intent).
    python3 app.py
    ```
 3. Open the local Gradio URL it prints.
+4. (Optional) Inspect MLflow experiment tracking in a second terminal:
+   ```bash
+   mlflow ui --backend-store-uri sqlite:///mlflow.db
+   ```
+   then open http://127.0.0.1:5000.
 
 ## Fine-tuning (requirement #8)
 
@@ -184,8 +196,14 @@ Download `intent-model.zip`, unzip it **next to `app.py`**. The app now shows
 zero-shot vs fine-tuned intent predictions side by side — a strong demo/viva point.
 The script prints test **accuracy** and **macro-F1**; quote them in the report.
 
+Alternatively it runs **locally on Apple Silicon** (`python3 finetune_intent.py`,
+~75 s on the Apple GPU via MPS) — no Colab needed.
+
 - Base model: DistilBERT (SLM, 66M params)
 - Dataset: Bitext Customer Support (~27k utterances, 27 intents) — same domain ✔
+- Reference results (8k samples, 2 epochs): **accuracy 0.9875, macro-F1 0.9869**
+- The run's hyperparameters and final metrics are logged to the MLflow experiment
+  `voicedesk-intent-finetune`
 
 ## LLMOps — metrics measured (≥5 required)
 
