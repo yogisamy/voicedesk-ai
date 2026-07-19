@@ -12,7 +12,7 @@ from docx.enum.table import WD_TABLE_ALIGNMENT
 from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
 
-SCREENSHOTS_DIR = "."
+SCREENSHOTS_DIR = "screenshots"
 SCREENSHOTS = {
     "support_pipeline": "Screenshot 2026-07-19 at 9.27.03 AM.png",
     "dashboard": "Screenshot 2026-07-19 at 9.27.21 AM.png",

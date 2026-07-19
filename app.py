@@ -26,6 +26,7 @@ import time
 import csv
 import datetime
 import tempfile
+import logging
 
 import gradio as gr
 import pandas as pd
@@ -33,7 +34,15 @@ from huggingface_hub import InferenceClient
 from gtts import gTTS
 from rouge_score import rouge_scorer
 
-# LLMOps: MLflow experiment tracking (optional — app still works without it)
+# ── Console logger ────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger("voicedesk")
+
+# ── MLflow experiment tracking (optional) ─────────────────────────────────────
 # Pin the store to <project>/mlflow.db so logging and `mlflow ui
 # --backend-store-uri sqlite:///mlflow.db` always see the same data.
 try:
@@ -42,8 +51,10 @@ try:
     mlflow.set_tracking_uri(f"sqlite:///{_DB}")
     mlflow.set_experiment("voicedesk-ai")
     MLFLOW_ON = True
-except Exception:
+    log.info("MLflow tracking enabled  →  %s", _DB)
+except Exception as e:
     MLFLOW_ON = False
+    log.warning("MLflow not available (%s) — CSV-only logging", e)
 
 # ----------------------------------------------------------------------------
 # Configuration
@@ -68,6 +79,26 @@ CANDIDATE_INTENTS = [
 ]
 
 EST_COST_PER_1K_TOKENS = 0.0002  # illustrative cost for LLMOps cost tracking
+
+# ----------------------------------------------------------------------------
+# MLflow tracing helper — creates a span in the Traces tab (MLflow ≥ 2.14)
+# Falls back to a no-op context manager when MLflow is unavailable.
+# ----------------------------------------------------------------------------
+from contextlib import contextmanager
+
+@contextmanager
+def _span(name, inputs=None):
+    """Wraps a block in an MLflow span (visible in the Traces tab)."""
+    if not MLFLOW_ON:
+        yield
+        return
+    try:
+        with mlflow.start_span(name=name) as span:
+            if inputs:
+                span.set_inputs(inputs)
+            yield span
+    except Exception:
+        yield  # tracing failure must never break the pipeline
 
 # ----------------------------------------------------------------------------
 # LLMOps: metrics logger
@@ -111,15 +142,18 @@ def timed(subtask, model_name, fn, *args, **kwargs):
 # ----------------------------------------------------------------------------
 # Sub-task 1: Speech-to-Text (Speech Recognition)
 # ----------------------------------------------------------------------------
-def speech_to_text(audio_path):
+def speech_to_text(audio_path, model=ASR_MODEL):
     if not audio_path:
         return ""
-    result, latency = timed("ASR", ASR_MODEL,
-                            client.automatic_speech_recognition,
-                            audio_path, model=ASR_MODEL)
-    text = result.text if hasattr(result, "text") else str(result)
-    log_metric("speech_to_text", ASR_MODEL, latency,
-               tokens=len(text.split()), extra=f"chars={len(text)}")
+    log.info("[1/7] STT  → %s  (file: %s)", model, audio_path)
+    with _span("speech_to_text", inputs={"audio_path": audio_path, "model": model}):
+        result, latency = timed("ASR", model,
+                                client.automatic_speech_recognition,
+                                audio_path, model=model)
+        text = result.text if hasattr(result, "text") else str(result)
+        log_metric("speech_to_text", model, latency,
+                   tokens=len(text.split()), extra=f"chars={len(text)}")
+    log.info("[1/7] STT  ← %.2fs | %d words | %.60s…", latency, len(text.split()), text)
     return text.strip()
 
 
@@ -129,39 +163,50 @@ def speech_to_text(audio_path):
 def text_to_speech(text):
     if not text:
         return None
-    t0 = time.time()
-    tts = gTTS(text=text[:500], lang="en")
-    out_path = os.path.join(tempfile.gettempdir(), "voicedesk_reply.mp3")
-    tts.save(out_path)
-    log_metric("text_to_speech", "gTTS", time.time() - t0,
-               tokens=len(text.split()))
+    log.info("[TTS]       → gTTS  (%d words)", len(text.split()))
+    with _span("text_to_speech", inputs={"text_preview": text[:80], "model": "gTTS"}):
+        t0 = time.time()
+        tts = gTTS(text=text[:500], lang="en")
+        out_path = os.path.join(tempfile.gettempdir(), "voicedesk_reply.mp3")
+        tts.save(out_path)
+        latency = time.time() - t0
+        log_metric("text_to_speech", "gTTS", latency,
+                   tokens=len(text.split()))
+    log.info("[TTS]       ← %.2fs | saved to %s", latency, out_path)
     return out_path
 
 
 # ----------------------------------------------------------------------------
 # Sub-task 3: Sentiment Analysis (NLP)
 # ----------------------------------------------------------------------------
-def analyze_sentiment(text):
-    result, latency = timed("sentiment", SENTIMENT_MODEL,
-                            client.text_classification, text,
-                            model=SENTIMENT_MODEL)
-    top = result[0]
-    scores = {r.label: r.score for r in result}
-    log_metric("sentiment", SENTIMENT_MODEL, latency, confidence=top.score)
+def analyze_sentiment(text, model=SENTIMENT_MODEL):
+    log.info("[3/7] SENT → %s", model)
+    with _span("sentiment_analysis", inputs={"text": text, "model": model}):
+        result, latency = timed("sentiment", model,
+                                client.text_classification, text,
+                                model=model)
+        top = result[0]
+        scores = {r.label: r.score for r in result}
+        log_metric("sentiment", model, latency, confidence=top.score)
+    log.info("[3/7] SENT ← %.2fs | %s (conf=%.4f)", latency, top.label, top.score)
     return scores, top.label, top.score
 
 
 # ----------------------------------------------------------------------------
 # Sub-task 4a: Intent Classification — zero-shot baseline (NLP)
 # ----------------------------------------------------------------------------
-def classify_intent_zeroshot(text):
-    result, latency = timed("intent_zeroshot", ZEROSHOT_MODEL,
-                            client.zero_shot_classification, text,
-                            candidate_labels=CANDIDATE_INTENTS,
-                            model=ZEROSHOT_MODEL)
-    top = result[0]
-    scores = {r.label: r.score for r in result}
-    log_metric("intent_zeroshot", ZEROSHOT_MODEL, latency, confidence=top.score)
+def classify_intent_zeroshot(text, model=ZEROSHOT_MODEL, intent_labels=CANDIDATE_INTENTS):
+    log.info("[4a]  ZS   → %s  (%d candidates)", model, len(intent_labels))
+    with _span("intent_zeroshot", inputs={"text": text, "model": model,
+                                          "candidates": intent_labels}):
+        result, latency = timed("intent_zeroshot", model,
+                                client.zero_shot_classification, text,
+                                candidate_labels=intent_labels,
+                                model=model)
+        top = result[0]
+        scores = {r.label: r.score for r in result}
+        log_metric("intent_zeroshot", model, latency, confidence=top.score)
+    log.info("[4a]  ZS   ← %.2fs | '%s' (conf=%.4f)", latency, top.label, top.score)
     return scores, top.label, top.score
 
 
@@ -171,34 +216,45 @@ def classify_intent_zeroshot(text):
 _finetuned_pipe = None
 
 
-def classify_intent_finetuned(text):
+def classify_intent_finetuned(text, model_dir=FINETUNED_DIR):
     """Loads the locally fine-tuned DistilBERT (see finetune_intent.py)."""
     global _finetuned_pipe
-    if not os.path.isdir(FINETUNED_DIR):
+    if not os.path.isdir(model_dir):
+        log.warning("[4b]  FT   — model not found at %s (run finetune_intent.py)", model_dir)
         return "fine-tuned model not found (run finetune_intent.py)", 0.0
     if _finetuned_pipe is None:
+        log.info("[4b]  FT   — loading model from %s …", model_dir)
         from transformers import pipeline
-        _finetuned_pipe = pipeline("text-classification", model=FINETUNED_DIR)
-    t0 = time.time()
-    out = _finetuned_pipe(text[:512])[0]
-    latency = time.time() - t0
-    log_metric("intent_finetuned", "distilbert-finetuned(Bitext)",
-               latency, confidence=out["score"])
+        _finetuned_pipe = pipeline("text-classification", model=model_dir)
+        log.info("[4b]  FT   — model loaded")
+    log.info("[4b]  FT   → distilbert-finetuned(Bitext)")
+    with _span("intent_finetuned", inputs={"text": text, "model_dir": model_dir}):
+        t0 = time.time()
+        out = _finetuned_pipe(text[:512])[0]
+        latency = time.time() - t0
+        log_metric("intent_finetuned", "distilbert-finetuned(Bitext)",
+                   latency, confidence=out["score"])
+    log.info("[4b]  FT   ← %.2fs | '%s' (conf=%.4f)", latency, out["label"], out["score"])
     return out["label"], out["score"]
 
 
 # ----------------------------------------------------------------------------
 # Sub-task 5: Named Entity Recognition (NLP)
 # ----------------------------------------------------------------------------
-def extract_entities(text):
-    result, latency = timed("ner", NER_MODEL,
-                            client.token_classification, text,
-                            model=NER_MODEL)
-    ents = [{"entity": e.entity_group, "start": e.start, "end": e.end}
-            for e in result]
-    avg_conf = sum(e.score for e in result) / len(result) if result else 0
-    log_metric("ner", NER_MODEL, latency, confidence=avg_conf,
-               extra=f"entities={len(ents)}")
+def extract_entities(text, model=NER_MODEL):
+    log.info("[5/7] NER  → %s", model)
+    with _span("named_entity_recognition", inputs={"text": text, "model": model}):
+        result, latency = timed("ner", model,
+                                client.token_classification, text,
+                                model=model)
+        ents = [{"entity": e.entity_group, "start": e.start, "end": e.end}
+                for e in result]
+        avg_conf = sum(e.score for e in result) / len(result) if result else 0
+        log_metric("ner", model, latency, confidence=avg_conf,
+                   extra=f"entities={len(ents)}")
+    log.info("[5/7] NER  ← %.2fs | %d entities found  %s",
+             latency, len(ents),
+             [(e["entity"], text[e["start"]:e["end"]]) for e in ents])
     return {"text": text, "entities": ents}
 
 
@@ -208,23 +264,29 @@ def extract_entities(text):
 _rouge = rouge_scorer.RougeScorer(["rouge1"], use_stemmer=True)
 
 
-def summarize(text):
+def summarize(text, model=SUMMARY_MODEL):
     if len(text.split()) < 15:
+        log.info("[6/7] SUM  — skipped (input < 15 words)")
         return text  # too short to summarise
-    result, latency = timed("summarization", SUMMARY_MODEL,
-                            client.summarization, text, model=SUMMARY_MODEL)
-    summary = result.summary_text if hasattr(result, "summary_text") else str(result)
-    rouge1 = _rouge.score(text, summary)["rouge1"].fmeasure
-    log_metric("summarization", SUMMARY_MODEL, latency,
-               confidence=rouge1, tokens=len(summary.split()),
-               extra="confidence column = ROUGE-1 F1")
+    log.info("[6/7] SUM  → %s  (%d words in)", model, len(text.split()))
+    with _span("summarization", inputs={"text": text, "model": model,
+                                        "word_count": len(text.split())}):
+        result, latency = timed("summarization", model,
+                                client.summarization, text, model=model)
+        summary = result.summary_text if hasattr(result, "summary_text") else str(result)
+        rouge1 = _rouge.score(text, summary)["rouge1"].fmeasure
+        log_metric("summarization", model, latency,
+                   confidence=rouge1, tokens=len(summary.split()),
+                   extra="confidence column = ROUGE-1 F1")
+    log.info("[6/7] SUM  ← %.2fs | %d words out | ROUGE-1=%.4f",
+             latency, len(summary.split()), rouge1)
     return summary
 
 
 # ----------------------------------------------------------------------------
 # Sub-task 7: Response Generation (NLP, LLM via API)
 # ----------------------------------------------------------------------------
-def generate_response(complaint, sentiment_label, intent):
+def generate_response(complaint, sentiment_label, intent, model=CHAT_MODEL):
     prompt = (
         "You are a polite customer-support agent for an online store. "
         f"The customer's message (sentiment: {sentiment_label}, "
@@ -232,16 +294,23 @@ def generate_response(complaint, sentiment_label, intent):
         "Write a short, empathetic, professional reply (max 120 words) "
         "with a concrete next step."
     )
-    t0 = time.time()
-    resp = client.chat_completion(
-        messages=[{"role": "user", "content": prompt}],
-        model=CHAT_MODEL, max_tokens=250,
-    )
-    latency = time.time() - t0
-    reply = resp.choices[0].message.content
-    total_tokens = getattr(resp.usage, "total_tokens", len(reply.split()))
-    log_metric("response_generation", CHAT_MODEL, latency,
-               tokens=total_tokens)
+    log.info("[7/7] LLM  → %s  (sentiment=%s, intent=%s)",
+             model, sentiment_label, intent)
+    with _span("response_generation", inputs={"complaint": complaint,
+                                              "sentiment": sentiment_label,
+                                              "intent": intent, "model": model}):
+        t0 = time.time()
+        resp = client.chat_completion(
+            messages=[{"role": "user", "content": prompt}],
+            model=model, max_tokens=250,
+        )
+        latency = time.time() - t0
+        reply = resp.choices[0].message.content
+        total_tokens = getattr(resp.usage, "total_tokens", len(reply.split()))
+        log_metric("response_generation", model, latency,
+                   tokens=total_tokens)
+    log.info("[7/7] LLM  ← %.2fs | %d tokens | %.80s…",
+             latency, total_tokens, reply.replace("\n", " "))
     return reply.strip()
 
 
@@ -250,6 +319,12 @@ def generate_response(complaint, sentiment_label, intent):
 # ----------------------------------------------------------------------------
 def run_pipeline(audio, typed_text):
     """Generator: yields after every sub-task so the UI fills in live."""
+    run_id = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    log.info("=" * 60)
+    log.info("PIPELINE START  run=%s  mode=%s", run_id, "voice" if audio else "text")
+    log.info("=" * 60)
+    pipeline_start = time.time()
+
     out = {"transcript": "", "sentiment": None, "intent_zs": None,
            "intent_ft": None, "entities": None, "summary": "",
            "reply": "", "audio": None}
@@ -261,19 +336,24 @@ def run_pipeline(audio, typed_text):
 
     yield snap("⏳ **Step 1/7** — transcribing audio…" if audio
                else "⏳ **Step 1/7** — reading complaint…")
+
     if MLFLOW_ON:
-        mlflow.start_run(
-            run_name=f"pipeline-{datetime.datetime.now():%Y%m%d-%H%M%S}")
+        mlflow.start_run(run_name=f"pipeline-{run_id}")
         mlflow.log_param("input_mode", "voice" if audio else "text")
+
     transcript = speech_to_text(audio) if audio else (typed_text or "").strip()
     if not transcript:
+        log.warning("PIPELINE — no input provided, aborting")
         if MLFLOW_ON:
             mlflow.end_run()
         yield snap("⚠️ Please record audio or type a complaint first.")
         return
+
     out["transcript"] = transcript
+    log.info("PIPELINE — transcript ready (%d words)", len(transcript.split()))
     if MLFLOW_ON:
         mlflow.log_param("transcript_words", len(transcript.split()))
+
     try:
         yield snap("⏳ **Step 2/7** — analysing sentiment…")
         sent_scores, sent_label, _ = analyze_sentiment(transcript)
@@ -296,7 +376,9 @@ def run_pipeline(audio, typed_text):
 
         yield snap("⏳ **Step 7/7** — converting reply to speech…")
         out["audio"] = text_to_speech(out["reply"])
+
     except Exception as e:
+        log.error("PIPELINE ERROR  %s: %s", type(e).__name__, e)
         if MLFLOW_ON:
             mlflow.set_tag("status", "failed")
         yield snap(f"❌ **{type(e).__name__}** — {e}")
@@ -305,6 +387,10 @@ def run_pipeline(audio, typed_text):
         if MLFLOW_ON:
             mlflow.end_run()
 
+    total = time.time() - pipeline_start
+    log.info("=" * 60)
+    log.info("PIPELINE DONE   run=%s  total=%.2fs", run_id, total)
+    log.info("=" * 60)
     yield snap("✅ **Done** — rate the reply below to log the feedback metric 👇")
 
 
@@ -430,4 +516,8 @@ with gr.Blocks(title="VoiceDesk AI") as demo:
                 "Customer Support dataset — see `finetune_intent.py`.")
 
 if __name__ == "__main__":
+    log.info("VoiceDesk AI starting up…")
+    log.info("HF_TOKEN set: %s", bool(HF_TOKEN))
+    log.info("Fine-tuned model: %s", "FOUND" if os.path.isdir(FINETUNED_DIR) else "NOT FOUND — run finetune_intent.py")
+    log.info("MLflow tracking: %s", "ON  →  mlflow ui --backend-store-uri sqlite:///mlflow.db" if MLFLOW_ON else "OFF")
     demo.launch(theme=gr.themes.Soft())

@@ -21,3 +21,4 @@ checkpoints/
 
 # macOS
 .DS_Store
+*.bits_api_assign
