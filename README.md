@@ -38,6 +38,7 @@ flowchart TB
 
     GTTS["☁️ [2] gTTS API<br/>Text-to-Speech"]
     CSV[("metrics_log.csv")]
+    MLF[("MLflow tracking store<br/>(mlflow ui)")]
 
     MIC --> UI
     TXT --> UI
@@ -46,6 +47,7 @@ flowchart TB
     ORCH --> FT
     ORCH --> GTTS
     ORCH --> LOGGER --> CSV --> DASH
+    LOGGER --> MLF
     ORCH --> SPK
 ```
 
@@ -198,6 +200,29 @@ The script prints test **accuracy** and **macro-F1**; quote them in the report.
 
 View them in the **📊 LLMOps Dashboard** tab (aggregated from `metrics_log.csv`).
 
+### MLflow experiment tracking
+
+Every metric is **also mirrored to MLflow** (industry-standard LLMOps tooling):
+
+- **`voicedesk-ai` experiment** — one MLflow run per pipeline execution, with
+  per-sub-task latency/confidence/token metrics, input-mode & transcript-length
+  params, and one run per 👍/👎 feedback event.
+- **`voicedesk-intent-finetune` experiment** — one run per fine-tuning job
+  (`finetune_intent.py`) logging hyperparameters (base model, dataset, epochs,
+  learning rate, batch size) and final test accuracy / macro-F1 / loss.
+
+Browse both at http://localhost:5000 by running **from the project folder**:
+
+```bash
+mlflow ui --backend-store-uri sqlite:///mlflow.db
+```
+
+(The `--backend-store-uri` flag matters: runs are logged to `mlflow.db`, and a
+plain `mlflow ui` would serve an empty `./mlruns` store instead.)
+
+MLflow is optional at runtime — if it isn't installed the app falls back to
+CSV-only logging.
+
 ## Suggested demo flow (viva)
 
 1. Record: *"Hi, this is Priya. My order 4521 from Chennai arrived damaged and I want a refund."*
@@ -216,5 +241,5 @@ View them in the **📊 LLMOps Dashboard** tab (aggregated from `metrics_log.csv
 | LLM/SLM models via APIs | Hugging Face Inference API (Whisper, DistilBERT, BART, Qwen2.5) + gTTS |
 | Cohesive unified objective | One end-to-end support-ticket pipeline |
 | Interactive & demonstrable | Gradio web app |
-| LLMOps, ≥5 metrics | 6 metrics + dashboard |
+| LLMOps, ≥5 metrics | 6 metrics + in-app dashboard + MLflow experiment tracking |
 | Fine-tune on same-domain dataset | DistilBERT on Bitext Customer Support |

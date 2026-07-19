@@ -4,6 +4,7 @@ huggingface_hub>=0.24
 gTTS>=2.5
 pandas
 rouge-score
+mlflow>=2.15    # LLMOps experiment tracking (view runs with: mlflow ui)
 
 # Needed to load the fine-tuned intent model locally
 transformers>=4.44

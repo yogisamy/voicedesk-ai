@@ -25,6 +25,17 @@ from transformers import (AutoTokenizer, AutoModelForSequenceClassification,
                           DataCollatorWithPadding)
 import evaluate
 
+# LLMOps: MLflow experiment tracking (optional — script works without it)
+try:
+    import os
+    import mlflow
+    _DB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mlflow.db")
+    mlflow.set_tracking_uri(f"sqlite:///{_DB}")
+    mlflow.set_experiment("voicedesk-intent-finetune")
+    MLFLOW_ON = True
+except Exception:
+    MLFLOW_ON = False
+
 BASE_MODEL = "distilbert-base-uncased"
 DATASET = "bitext/Bitext-customer-support-llm-chatbot-training-dataset"
 OUTPUT_DIR = "./intent-model"
@@ -98,12 +109,31 @@ trainer = Trainer(
 )
 
 # ---------------------------------------------------------------- train
+if MLFLOW_ON:
+    mlflow.start_run(run_name="distilbert-bitext-intent")
+    mlflow.log_params({
+        "base_model": BASE_MODEL, "dataset": DATASET,
+        "max_samples": MAX_SAMPLES, "epochs": EPOCHS,
+        "num_intents": len(labels),
+        "learning_rate": args.learning_rate,
+        "train_batch_size": args.per_device_train_batch_size,
+    })
+
 trainer.train()
 
 metrics = trainer.evaluate()
 print("\n===== FINAL TEST METRICS (quote these in the report) =====")
 print(f"Accuracy : {metrics['eval_accuracy']:.4f}")
 print(f"Macro F1 : {metrics['eval_macro_f1']:.4f}")
+
+if MLFLOW_ON:
+    mlflow.log_metrics({
+        "test_accuracy": metrics["eval_accuracy"],
+        "test_macro_f1": metrics["eval_macro_f1"],
+        "test_loss": metrics["eval_loss"],
+    })
+    mlflow.end_run()
+    print("MLflow run logged — inspect with: mlflow ui")
 
 trainer.save_model(OUTPUT_DIR)
 tok.save_pretrained(OUTPUT_DIR)

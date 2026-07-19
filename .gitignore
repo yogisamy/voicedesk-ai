@@ -9,6 +9,11 @@ __pycache__/
 
 # Runtime-generated metrics (recreated on each run)
 metrics_log.csv
+finetune_run.log
+
+# MLflow local tracking store
+mlruns/
+mlflow.db
 
 # Fine-tuned model weights (large; regenerate with finetune_intent.py)
 intent-model/
