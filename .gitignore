@@ -1,0 +1,18 @@
+# Virtual environment (note: also covers a .env secrets file — never commit tokens)
+.env/
+.env
+venv/
+
+# Python bytecode
+__pycache__/
+*.pyc
+
+# Runtime-generated metrics (recreated on each run)
+metrics_log.csv
+
+# Fine-tuned model weights (large; regenerate with finetune_intent.py)
+intent-model/
+checkpoints/
+
+# macOS
+.DS_Store

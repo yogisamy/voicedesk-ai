@@ -1,0 +1,16 @@
+# Core app
+gradio>=4.44
+huggingface_hub>=0.24
+gTTS>=2.5
+pandas
+rouge-score
+
+# Needed to load the fine-tuned intent model locally
+transformers>=4.44
+torch
+
+# Fine-tuning (run in Google Colab, not needed just to launch the app)
+datasets
+evaluate
+accelerate
+scikit-learn
