@@ -9,23 +9,96 @@ speaks the reply back — while logging LLMOps metrics for every API call.
 
 ## Architecture
 
-```
-🎙️ Voice / Text complaint
-        │
-        ▼
-[1] Whisper-large-v3 (HF API) ── Speech-to-Text          (Speech Recognition)
-        │
-        ├─▶ [3] DistilBERT-SST-2 ─ Sentiment              (NLP)
-        ├─▶ [4] BART-MNLI zero-shot ┐
-        │       DistilBERT fine-tuned ┘ Intent            (NLP)  ← requirement #8
-        ├─▶ [5] BERT-NER ─ Named Entities                 (NLP)
-        ├─▶ [6] BART-CNN ─ Ticket Summary                 (NLP)
-        └─▶ [7] Qwen2.5-7B-Instruct (HF API) ─ Reply      (NLP)
-                    │
-                    ▼
-        [2] gTTS ─ Text-to-Speech reply                   (Speech Recognition)
+### High-Level Design (HLD)
 
-All calls ──▶ metrics_log.csv ──▶ 📊 LLMOps Dashboard tab
+```mermaid
+flowchart TB
+    subgraph CLIENT["👤 User (Browser)"]
+        MIC["🎙️ Voice complaint<br/>(mic / upload)"]
+        TXT["⌨️ Typed complaint"]
+        SPK["🔊 Spoken reply + results"]
+    end
+
+    subgraph APP["🖥️ Gradio Web App — app.py"]
+        UI["📞 Support Pipeline tab"]
+        ORCH["run_pipeline( ) orchestrator"]
+        FT["🎯 Fine-tuned DistilBERT<br/>(local ./intent-model, req #8)"]
+        LOGGER["log_metric( )"]
+        DASH["📊 LLMOps Dashboard tab"]
+    end
+
+    subgraph HFAPI["☁️ Hugging Face Inference API"]
+        ASR["[1] Whisper-large-v3<br/>Speech-to-Text"]
+        SENT["[3] DistilBERT-SST-2<br/>Sentiment"]
+        ZS["[4a] BART-large-MNLI<br/>Zero-shot Intent"]
+        NER["[5] BERT-base-NER<br/>Named Entities"]
+        SUM["[6] BART-large-CNN<br/>Summarization"]
+        LLM["[7] Qwen2.5-7B-Instruct<br/>Reply Generation"]
+    end
+
+    GTTS["☁️ [2] gTTS API<br/>Text-to-Speech"]
+    CSV[("metrics_log.csv")]
+
+    MIC --> UI
+    TXT --> UI
+    UI --> ORCH
+    ORCH --> ASR & SENT & ZS & NER & SUM & LLM
+    ORCH --> FT
+    ORCH --> GTTS
+    ORCH --> LOGGER --> CSV --> DASH
+    ORCH --> SPK
+```
+
+### Low-Level Design (LLD)
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor User
+    participant UI as Gradio UI
+    participant P as run_pipeline()
+    participant HF as HF Inference API
+    participant FT as Local fine-tuned<br/>DistilBERT
+    participant G as gTTS API
+    participant CSV as metrics_log.csv
+
+    User->>UI: record / type complaint, click ▶ Run
+    UI->>P: (audio, typed_text)
+
+    P->>HF: speech_to_text() — whisper-large-v3
+    HF-->>P: transcript
+    P->>CSV: latency, word count
+
+    P->>HF: analyze_sentiment() — distilbert-sst-2
+    HF-->>P: label + confidence
+    P->>CSV: latency, confidence
+
+    P->>HF: classify_intent_zeroshot() — bart-large-mnli (7 candidate intents)
+    HF-->>P: intent + confidence
+    P->>FT: classify_intent_finetuned() — ./intent-model
+    FT-->>P: intent + confidence
+    P->>CSV: latency, confidence (both models)
+
+    P->>HF: extract_entities() — bert-base-NER
+    HF-->>P: entities (PER / ORG / LOC)
+    P->>CSV: latency, avg confidence, count
+
+    P->>HF: summarize() — bart-large-cnn (if ≥15 words)
+    HF-->>P: ticket summary
+    P->>P: ROUGE-1 F1 vs original
+    P->>CSV: latency, ROUGE-1, tokens
+
+    P->>HF: generate_response() — qwen2.5-7b chat_completion<br/>(prompt = complaint + sentiment + intent)
+    HF-->>P: empathetic reply
+    P->>CSV: latency, tokens, est. cost
+
+    P->>G: text_to_speech(reply)
+    G-->>P: MP3 audio
+    P->>CSV: latency
+
+    P-->>UI: transcript, sentiment, intents, entities, summary, reply, audio
+    UI-->>User: display results + play spoken reply
+    User->>UI: 👍 / 👎 feedback → logged to CSV
 ```
 
 ## Sub-tasks implemented (7)
